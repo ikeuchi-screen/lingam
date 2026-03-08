@@ -12,3 +12,4 @@ semopy
 autograd
 #optional (install if gpu and cuda is available)
 # culingam
+# torch>=2.0  (for ABICLiNGAM_GPU)

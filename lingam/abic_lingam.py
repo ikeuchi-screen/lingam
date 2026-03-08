@@ -556,6 +556,439 @@ class ABICLiNGAM(_BaseLiNGAM):
         return self._omega
 
 
+class ABICLiNGAM_GPU(ABICLiNGAM):
+    """GPU-accelerated implementation of ABIC-LiNGAM using PyTorch. [1]_
+
+    Replaces the autograd + scipy L-BFGS-B optimization stack with
+    PyTorch tensors and ``torch.optim.LBFGS``, enabling GPU acceleration
+    via CUDA. Falls back to CPU if CUDA is unavailable.
+
+    Requires PyTorch >= 2.0: ``pip install torch``
+
+    References
+    ----------
+    .. [1] Y. Morinishi and S. Shimizu. Differentiable causal discovery of
+       linear non-Gaussian acyclic models under unmeasured confounding.
+       Transactions on Machine Learning Research (TMLR), 2025.
+    """
+
+    def __init__(
+        self,
+        beta=1.0,
+        lam=0.05,
+        acyc_order=None,
+        seed=0,
+        max_outer=100,
+        tol_h=1e-8,
+        min_causal_effect=0.05,
+        min_error_covariance=0.05,
+        rho_max=1e16,
+        inner_start=1,
+        inner_growth=1,
+        inner_tol=1e-4,
+    ):
+        """Construct a ABICLiNGAM_GPU model.
+
+        Parameters are identical to :class:`ABICLiNGAM`.
+        PyTorch is required (``pip install torch``).
+        CUDA is used automatically when available; otherwise falls back to CPU.
+        """
+        super().__init__(
+            beta=beta,
+            lam=lam,
+            acyc_order=acyc_order,
+            seed=seed,
+            max_outer=max_outer,
+            tol_h=tol_h,
+            min_causal_effect=min_causal_effect,
+            min_error_covariance=min_error_covariance,
+            rho_max=rho_max,
+            inner_start=inner_start,
+            inner_growth=inner_growth,
+            inner_tol=inner_tol,
+        )
+
+    def fit(self, X):
+        """Fit the model to X using PyTorch (GPU if CUDA available).
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            Observed data matrix.
+
+        Returns
+        -------
+        self : object
+            Returns the instance itself.
+        """
+        try:
+            import torch
+        except ImportError:
+            raise ImportError(
+                "PyTorch is required for ABICLiNGAM_GPU. "
+                "Install with: pip install torch"
+            )
+
+        self._torch = torch
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self._X = anp.asarray(check_array(X))
+        d = self._X.shape[1]
+        self._rng = np.random.default_rng(self._seed)
+
+        if d < 2:
+            raise ValueError("Data must have at least two variables (features).")
+
+        # Precompute index structures for batched ops
+        self._precompute_index_structures(d)
+        self._precompute_free_masks(d)
+
+        # Upload data to device
+        self._Xt = torch.tensor(
+            np.asarray(self._X), dtype=torch.float64, device=self._device
+        )
+
+        # Initialize parameters (numpy)
+        B = np.array(self._rng.uniform(-0.5, 0.5, size=(d, d)))
+        L = np.array(self._rng.uniform(-0.05, 0.05, size=(d, d)))
+        lower_mask = np.tril(np.ones((d, d)), k=-1)
+        L = L * lower_mask
+        L = L + L.T
+        L = L - np.diag(np.diag(L))
+        D = np.diag(np.diag(np.cov(self._X.T)))
+
+        rho, alpha, h_prev = 1.0, 0.0, np.inf
+        inner_cap = self._inner_start
+
+        for _ in range(self._max_outer):
+            B_new, L_new, D_new = None, None, None
+            h_new = None
+
+            while rho < self._rho_max:
+                B_new = B.copy()
+                L_new = L.copy()
+                D_new = D.copy()
+
+                for _ in range(inner_cap):
+                    B_old, L_old, D_old = B_new.copy(), L_new.copy(), D_new.copy()
+
+                    # Compute pseudo-variables on device (batched solve)
+                    B_t = torch.tensor(B_new, dtype=torch.float64, device=self._device)
+                    omega_t = torch.tensor(
+                        L_new + D_new, dtype=torch.float64, device=self._device
+                    )
+                    Z_t = self._pseudo_torch(B_t, omega_t)
+
+                    # Optimize via PyTorch LBFGS
+                    b_np, l_np = self._pack_numpy(B_new, L_new)
+                    b_np, l_np = self._lbfgs_torch_inner(
+                        b_np, l_np, rho, alpha, Z_t, self._bow_penalty_torch
+                    )
+                    B_new, L_new_lower = self._unpack_numpy(b_np, l_np, d)
+                    L_new = L_new_lower + L_new_lower.T
+                    L_new = L_new - np.diag(np.diag(L_new))
+
+                    # Refresh diagonal noise from residuals
+                    diag_vals = [
+                        np.var(self._X[:, j] - self._X @ B_new[:, j])
+                        for j in range(d)
+                    ]
+                    D_new = np.diag(diag_vals)
+
+                    delta = np.sum(np.abs(B_old - B_new)) + np.sum(
+                        np.abs((L_old + D_old) - (L_new + D_new))
+                    )
+                    if float(delta) < self._inner_tol:
+                        break
+
+                # Compute h via torch (no grad needed)
+                B_t2 = torch.tensor(B_new, dtype=torch.float64, device=self._device)
+                L_t2 = torch.tensor(L_new, dtype=torch.float64, device=self._device)
+                with torch.no_grad():
+                    h_new = float(
+                        (self._acyclicity_penalty_torch(B_t2)
+                         + self._bow_penalty_torch(B_t2, L_t2)).item()
+                    )
+
+                if float(h_new) < 0.25 * float(h_prev):
+                    break
+                else:
+                    rho *= 10.0
+
+            B, L, D = B_new.copy(), L_new.copy(), D_new.copy()
+            h_prev = h_new
+            alpha = alpha + rho * h_prev
+            inner_cap += self._inner_growth
+
+            if float(h_prev) <= self._tol_h or rho >= self._rho_max:
+                break
+
+        self._B = np.where(np.abs(B) < self._min_causal_effect, 0.0, B)
+        self._omega = np.where(
+            np.abs(L + D) < self._min_error_covariance, 0.0, (L + D)
+        )
+
+        # Merge coefficient matrix and error covariance matrix
+        omega_copied = self._omega.copy()
+        np.fill_diagonal(omega_copied, 0.0)
+        omega_copied[np.abs(omega_copied) > 0] = np.nan
+        self._adjacency_matrix = self._B.T.copy()
+        self._adjacency_matrix[np.isnan(omega_copied)] = np.nan
+
+        self._causal_order = self._causal_order_from_adjacency_matrix(self._B.T)
+
+        return self
+
+    # -------------------------------------------------------------------------
+    # PyTorch helper methods
+    # -------------------------------------------------------------------------
+
+    def _precompute_index_structures(self, d):
+        """Precompute index tensors for batched pseudo-variable computation."""
+        torch = self._torch
+        device = self._device
+
+        # sub_idx[j] = all indices 0..d-1 except j, shape (d, d-1)
+        sub_idx = torch.zeros(d, d - 1, dtype=torch.long, device=device)
+        for j in range(d):
+            sub_idx[j] = torch.cat([
+                torch.arange(j, device=device),
+                torch.arange(j + 1, d, device=device),
+            ])
+        self._sub_idx = sub_idx  # (d, d-1)
+
+        # Indices for building omega_sub: (d, d-1, d-1)
+        self._omega_row_idx = sub_idx.unsqueeze(2).expand(d, d - 1, d - 1)
+        self._omega_col_idx = sub_idx.unsqueeze(1).expand(d, d - 1, d - 1)
+
+        # insert_target[j] = sub_idx[j], used for scatter into zero column
+        self._insert_target = sub_idx  # (d, d-1)
+
+    def _precompute_free_masks(self, d, exogenous=()):
+        """Build boolean masks for free (non-fixed-zero) parameters."""
+        exo = set(exogenous)
+
+        # B: all off-diagonal entries are free (diagonal fixed to 0)
+        free_B = np.ones((d, d), dtype=bool)
+        np.fill_diagonal(free_B, False)
+
+        free_B_rows, free_B_cols = np.where(free_B)
+        self._free_B_rows_np = free_B_rows
+        self._free_B_cols_np = free_B_cols
+        self._n_free_B = int(free_B.sum())
+
+        torch = self._torch
+        device = self._device
+        self._free_B_rows_t = torch.tensor(free_B_rows, dtype=torch.long, device=device)
+        self._free_B_cols_t = torch.tensor(free_B_cols, dtype=torch.long, device=device)
+
+        # L: only strictly lower-triangular entries, excluding exogenous vars
+        lower_tri_r, lower_tri_c = np.tril_indices(d, k=-1)
+        free_L_1d = np.array([
+            (i not in exo) and (j not in exo)
+            for i, j in zip(lower_tri_r, lower_tri_c)
+        ], dtype=bool)
+
+        self._lower_tri_r = lower_tri_r
+        self._lower_tri_c = lower_tri_c
+        self._free_L_mask_1d_np = free_L_1d
+        self._n_free_L = int(free_L_1d.sum())
+        self._n_lower_tri = len(lower_tri_r)
+
+        self._lower_tri_r_t = torch.tensor(lower_tri_r, dtype=torch.long, device=device)
+        self._lower_tri_c_t = torch.tensor(lower_tri_c, dtype=torch.long, device=device)
+        self._free_L_idx_in_lower_t = torch.tensor(
+            np.where(free_L_1d)[0], dtype=torch.long, device=device
+        )
+
+    def _pack_numpy(self, B_np, L_np):
+        """Extract free parameters as numpy arrays."""
+        b_free = B_np[self._free_B_rows_np, self._free_B_cols_np]
+        l_lower = L_np[self._lower_tri_r, self._lower_tri_c]
+        l_free = l_lower[self._free_L_mask_1d_np]
+        return b_free, l_free
+
+    def _unpack_numpy(self, b_free_np, l_free_np, d):
+        """Reconstruct full B (d,d) and lower-tri L (d,d) from free params."""
+        B = np.zeros((d, d), dtype=np.float64)
+        B[self._free_B_rows_np, self._free_B_cols_np] = b_free_np
+
+        l_lower_full = np.zeros(self._n_lower_tri, dtype=np.float64)
+        l_lower_full[self._free_L_mask_1d_np] = l_free_np
+        L = np.zeros((d, d), dtype=np.float64)
+        L[self._lower_tri_r, self._lower_tri_c] = l_lower_full
+        return B, L
+
+    def _unpack_torch(self, b_free, l_free):
+        """Reconstruct B (d,d) and symmetric L (d,d) from free tensors.
+
+        Differentiable w.r.t. b_free and l_free via index_put/scatter.
+        """
+        torch = self._torch
+        device = self._device
+        d = self._Xt.shape[1]
+
+        B = torch.zeros(d, d, dtype=torch.float64, device=device)
+        B = B.index_put((self._free_B_rows_t, self._free_B_cols_t), b_free)
+
+        l_lower_full = torch.zeros(
+            self._n_lower_tri, dtype=torch.float64, device=device
+        )
+        l_lower_full = l_lower_full.scatter(0, self._free_L_idx_in_lower_t, l_free)
+        L_lower = torch.zeros(d, d, dtype=torch.float64, device=device)
+        L_lower = L_lower.index_put(
+            (self._lower_tri_r_t, self._lower_tri_c_t), l_lower_full
+        )
+        L = L_lower + L_lower.T  # symmetrize; diagonal stays zero
+
+        return B, L
+
+    def _pseudo_torch(self, B_t, omega_t):
+        """Batched pseudo-variable computation via torch.linalg.solve.
+
+        Parameters
+        ----------
+        B_t : torch.Tensor, shape (d, d)
+        omega_t : torch.Tensor, shape (d, d)
+
+        Returns
+        -------
+        Z_t : torch.Tensor, shape (d, n, d)
+            Z_t[j] is the (n, d) pseudo-variable matrix for variable j,
+            with column j zeroed out.
+        """
+        torch = self._torch
+        device = self._device
+        X_t = self._Xt
+        n, d = X_t.shape
+
+        eps_t = X_t - X_t @ B_t  # (n, d)
+
+        # Build batched (d, d-1, d-1) omega submatrices
+        omega_sub = omega_t[self._omega_row_idx, self._omega_col_idx]
+
+        # Build batched (d, n, d-1) eps submatrices
+        eps_sub = eps_t[:, self._sub_idx].permute(1, 0, 2)  # (d, n, d-1)
+
+        # Batched solve: omega_sub[j] @ Z_sub[j].T = eps_sub[j].T
+        Z_sub = torch.linalg.solve(
+            omega_sub, eps_sub.permute(0, 2, 1)
+        ).permute(0, 2, 1)  # (d, n, d-1)
+
+        # Scatter Z_sub into zero-column output Z_t
+        Z_t = torch.zeros(d, n, d, dtype=torch.float64, device=device)
+        idx_expanded = self._insert_target.unsqueeze(1).expand(d, n, d - 1)
+        Z_t.scatter_(2, idx_expanded, Z_sub)
+
+        return Z_t  # (d, n, d)
+
+    def _acyclicity_penalty_torch(self, W_t, K=None):
+        """Smooth acyclicity surrogate (truncated series) in PyTorch.
+
+        h(W) = sum_{k=1..K} trace((W*W)^k) / k!
+        """
+        torch = self._torch
+        device = self._device
+        d = W_t.shape[0]
+        if K is None:
+            K = self._acyc_order or d
+        A = W_t * W_t
+        Ak = torch.eye(d, dtype=torch.float64, device=device)
+        acc = torch.zeros(1, dtype=torch.float64, device=device)
+        for k in range(1, K + 1):
+            Ak = Ak @ A
+            acc = acc + torch.trace(Ak) / float(math.factorial(k))
+        return acc
+
+    @staticmethod
+    def _bow_penalty_torch(W1_t, W2_t):
+        """Bow-freeness surrogate in PyTorch."""
+        A = W1_t * W2_t
+        return torch.sum(A * A) / A.numel()
+
+    def _objective_torch(self, b_free, l_free, rho, alpha, Z_t, penalty_fn_torch):
+        """Augmented Lagrangian objective with PyTorch autograd.
+
+        Parameters
+        ----------
+        b_free : torch.Tensor, shape (n_free_B,), requires_grad=True
+        l_free : torch.Tensor, shape (n_free_L,), requires_grad=True
+        rho : float
+        alpha : float
+        Z_t : torch.Tensor, shape (d, n, d)  -- treated as constant
+        penalty_fn_torch : callable(B_t, L_t) -> scalar tensor
+        """
+        torch = self._torch
+        X_t = self._Xt
+        n, d = X_t.shape
+
+        B_t, L_t = self._unpack_torch(b_free, l_free)
+
+        # Least-squares term
+        LS = torch.zeros(1, dtype=torch.float64, device=self._device)
+        for j in range(d):
+            r = X_t[:, j] - X_t @ B_t[:, j] - Z_t[j] @ L_t[:, j]
+            LS = LS + 0.5 / n * (torch.linalg.norm(r) ** (2.0 * self._beta))
+
+        # Structural penalty
+        h = self._acyclicity_penalty_torch(B_t) + penalty_fn_torch(B_t, L_t)
+        aug = 0.5 * rho * (h ** 2) + alpha * h
+
+        # Smooth L0 regularization — numerically stable tanh form
+        # tanh(s/2) == (e^s - 1)/(e^s + 1), avoids float64 overflow
+        theta_free = torch.cat([b_free, l_free])
+        s = math.log(float(n)) * torch.abs(theta_free)
+        reg = self._lam * torch.sum(torch.tanh(s / 2.0))
+
+        return LS + aug + reg
+
+    def _lbfgs_torch_inner(
+        self, b_free_np, l_free_np, rho, alpha, Z_t, penalty_fn_torch
+    ):
+        """Run torch.optim.LBFGS, replacing scipy L-BFGS-B.
+
+        Parameters
+        ----------
+        b_free_np : numpy array, shape (n_free_B,)
+        l_free_np : numpy array, shape (n_free_L,)
+
+        Returns
+        -------
+        b_free_np : numpy array
+        l_free_np : numpy array
+        """
+        torch = self._torch
+        device = self._device
+
+        b_free = torch.tensor(
+            b_free_np, dtype=torch.float64, device=device, requires_grad=True
+        )
+        l_free = torch.tensor(
+            l_free_np, dtype=torch.float64, device=device, requires_grad=True
+        )
+
+        optimizer = torch.optim.LBFGS(
+            [b_free, l_free],
+            max_iter=100,
+            tolerance_grad=1e-7,
+            tolerance_change=1e-9,
+            history_size=100,
+            line_search_fn="strong_wolfe",
+        )
+
+        def closure():
+            optimizer.zero_grad()
+            loss = self._objective_torch(
+                b_free, l_free, rho, alpha, Z_t, penalty_fn_torch
+            )
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+
+        return b_free.detach().cpu().numpy(), l_free.detach().cpu().numpy()
+
+
 class ABICBootstrapResult(BootstrapResult):
     """The result of bootstrapping for Time series algorithm."""
 
