@@ -648,6 +648,26 @@ class ABICLiNGAM_GPU(ABICLiNGAM):
             np.asarray(self._X), dtype=torch.float64, device=self._device
         )
 
+        # Pre-allocate GPU-resident tensors to avoid CUDA malloc in the inner loop
+        B_t = torch.empty(d, d, dtype=torch.float64, device=self._device)
+        omega_t = torch.empty(d, d, dtype=torch.float64, device=self._device)
+        L_t = torch.empty(d, d, dtype=torch.float64, device=self._device)
+        self._b_free_buf = torch.empty(
+            self._n_free_B, dtype=torch.float64, device=self._device
+        )
+        self._l_free_buf = torch.empty(
+            self._n_free_L, dtype=torch.float64, device=self._device
+        )
+
+        # JIT-compile hot paths (PyTorch >= 2.0 + triton required; skip silently otherwise)
+        if hasattr(torch, "compile"):
+            try:
+                import triton  # noqa: F401 — required by torch.compile backend
+                self._pseudo_torch = torch.compile(self._pseudo_torch)
+                self._objective_torch = torch.compile(self._objective_torch)
+            except (ImportError, Exception):
+                pass
+
         # Initialize parameters (numpy)
         B = np.array(self._rng.uniform(-0.5, 0.5, size=(d, d)))
         L = np.array(self._rng.uniform(-0.05, 0.05, size=(d, d)))
@@ -673,10 +693,8 @@ class ABICLiNGAM_GPU(ABICLiNGAM):
                     B_old, L_old, D_old = B_new.copy(), L_new.copy(), D_new.copy()
 
                     # Compute pseudo-variables on device (batched solve)
-                    B_t = torch.tensor(B_new, dtype=torch.float64, device=self._device)
-                    omega_t = torch.tensor(
-                        L_new + D_new, dtype=torch.float64, device=self._device
-                    )
+                    B_t.copy_(torch.from_numpy(B_new))
+                    omega_t.copy_(torch.from_numpy(L_new + D_new))
                     Z_t = self._pseudo_torch(B_t, omega_t)
 
                     # Optimize via PyTorch LBFGS
@@ -688,12 +706,11 @@ class ABICLiNGAM_GPU(ABICLiNGAM):
                     L_new = L_new_lower + L_new_lower.T
                     L_new = L_new - np.diag(np.diag(L_new))
 
-                    # Refresh diagonal noise from residuals
-                    diag_vals = [
-                        np.var(self._X[:, j] - self._X @ B_new[:, j])
-                        for j in range(d)
-                    ]
-                    D_new = np.diag(diag_vals)
+                    # Refresh diagonal noise from residuals (GPU vectorised)
+                    B_t.copy_(torch.from_numpy(B_new))
+                    with torch.no_grad():
+                        resid = self._Xt - self._Xt @ B_t  # (n, d)
+                        D_new = torch.diag(resid.var(dim=0)).cpu().numpy()
 
                     delta = np.sum(np.abs(B_old - B_new)) + np.sum(
                         np.abs((L_old + D_old) - (L_new + D_new))
@@ -701,13 +718,12 @@ class ABICLiNGAM_GPU(ABICLiNGAM):
                     if float(delta) < self._inner_tol:
                         break
 
-                # Compute h via torch (no grad needed)
-                B_t2 = torch.tensor(B_new, dtype=torch.float64, device=self._device)
-                L_t2 = torch.tensor(L_new, dtype=torch.float64, device=self._device)
+                # Compute h via torch (no grad needed) — B_t already up-to-date
+                L_t.copy_(torch.from_numpy(L_new))
                 with torch.no_grad():
                     h_new = float(
-                        (self._acyclicity_penalty_torch(B_t2)
-                         + self._bow_penalty_torch(B_t2, L_t2)).item()
+                        (self._acyclicity_penalty_torch(B_t)
+                         + self._bow_penalty_torch(B_t, L_t)).item()
                     )
 
                 if float(h_new) < 0.25 * float(h_prev):
@@ -904,7 +920,7 @@ class ABICLiNGAM_GPU(ABICLiNGAM):
     def _bow_penalty_torch(W1_t, W2_t):
         """Bow-freeness surrogate in PyTorch."""
         A = W1_t * W2_t
-        return torch.sum(A * A) / A.numel()
+        return (A * A).sum() / A.numel()
 
     def _objective_torch(self, b_free, l_free, rho, alpha, Z_t, penalty_fn_torch):
         """Augmented Lagrangian objective with PyTorch autograd.
@@ -920,15 +936,15 @@ class ABICLiNGAM_GPU(ABICLiNGAM):
         """
         torch = self._torch
         X_t = self._Xt
-        n, d = X_t.shape
+        n = X_t.shape[0]
 
         B_t, L_t = self._unpack_torch(b_free, l_free)
 
-        # Least-squares term
-        LS = torch.zeros(1, dtype=torch.float64, device=self._device)
-        for j in range(d):
-            r = X_t[:, j] - X_t @ B_t[:, j] - Z_t[j] @ L_t[:, j]
-            LS = LS + 0.5 / n * (torch.linalg.norm(r) ** (2.0 * self._beta))
+        # Least-squares term (vectorised over j)
+        ZL = torch.einsum('jnd,dj->nj', Z_t, L_t)  # (n, d)
+        R = X_t - X_t @ B_t - ZL                    # (n, d)
+        norms = torch.linalg.norm(R, dim=0)          # (d,)
+        LS = 0.5 / n * (norms ** (2.0 * self._beta)).sum()
 
         # Structural penalty
         h = self._acyclicity_penalty_torch(B_t) + penalty_fn_torch(B_t, L_t)
@@ -958,14 +974,12 @@ class ABICLiNGAM_GPU(ABICLiNGAM):
         l_free_np : numpy array
         """
         torch = self._torch
-        device = self._device
 
-        b_free = torch.tensor(
-            b_free_np, dtype=torch.float64, device=device, requires_grad=True
-        )
-        l_free = torch.tensor(
-            l_free_np, dtype=torch.float64, device=device, requires_grad=True
-        )
+        # Reuse pre-allocated GPU buffers to avoid CUDA malloc per iteration
+        self._b_free_buf.copy_(torch.from_numpy(b_free_np))
+        self._l_free_buf.copy_(torch.from_numpy(l_free_np))
+        b_free = self._b_free_buf.clone().requires_grad_(True)
+        l_free = self._l_free_buf.clone().requires_grad_(True)
 
         optimizer = torch.optim.LBFGS(
             [b_free, l_free],
