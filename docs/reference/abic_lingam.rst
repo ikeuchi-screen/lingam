@@ -1,4 +1,4 @@
-.. module:: lingam
+.. module:: lingam.experimental
 
 ABICLiNGAM
 ==========
